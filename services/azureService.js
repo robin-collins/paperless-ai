@@ -5,37 +5,40 @@ const tiktoken = require('tiktoken');
 const paperlessService = require('./paperlessService');
 const fs = require('fs').promises;
 const path = require('path');
+const { RateLimitHandler, RateLimitTracker, ThrottleManager, ApiCallTracker } = require('./rateLimitUtils');
 
 class AzureOpenAIService {
   constructor() {
     this.client = null;
     this.tokenizer = null;
+    this.rateLimitHandler = new RateLimitHandler();
+    this.rateLimitTracker = new RateLimitTracker();
+    this.throttleManager = new ThrottleManager();
+    this.apiCallTracker = new ApiCallTracker();
   }
 
   initialize() {
-    if (!this.client && config.aiProvider === 'ollama') {
+    if (!this.client && config.azure.endpoint && config.azure.apiKey) {
+      const azureEndpoint = config.azure.endpoint.endsWith('/') ? config.azure.endpoint : config.azure.endpoint + '/';
+      const azureDeploymentName = config.azure.deploymentName || 'gpt-4';
+      const azureApiVersion = config.azure.apiVersion || '2023-05-15';
+      
+      console.log(`[DEBUG] Initializing Azure OpenAI client with endpoint: ${azureEndpoint}`);
+      console.log(`[DEBUG] Using deployment: ${azureDeploymentName}, API version: ${azureApiVersion}`);
+      
       this.client = new OpenAI({
-        baseURL: config.ollama.apiUrl + '/v1',
-        apiKey: 'ollama'
-      });
-    } else if (!this.client && config.aiProvider === 'custom') {
-      this.client = new OpenAI({
-        baseURL: config.custom.apiUrl,
-        apiKey: config.custom.apiKey
-      });
-    } else if (!this.client && config.aiProvider === 'openai') {
-    if (!this.client && config.openai.apiKey) {
-      this.client = new OpenAI({
-        apiKey: config.openai.apiKey
-      });
-    }
-    } else if (!this.client && config.aiProvider === 'azure') {
-      this.client = new AzureOpenAI({
         apiKey: config.azure.apiKey,
-        endpoint: config.azure.endpoint,
-        deploymentName: config.azure.deploymentName,
-        apiVersion: config.azure.apiVersion
+        baseURL: `${azureEndpoint}openai/deployments/${azureDeploymentName}`,
+        defaultQuery: { 'api-version': azureApiVersion },
+        defaultHeaders: { 'api-key': config.azure.apiKey }
       });
+      
+      this.rateLimitTracker = new RateLimitTracker();
+      this.throttleManager = new ThrottleManager();
+      this.rateLimitHandler = new RateLimitHandler();
+      this.apiCallTracker = new ApiCallTracker();
+      
+      console.log('[DEBUG] Azure service initialized with rate limit tracking');
     }
   }
 
@@ -180,59 +183,142 @@ class AzureOpenAIService {
       
       await this.writePromptToFile(systemPrompt, truncatedContent);
 
-      const response = await this.client.chat.completions.create({
-        model: model,
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt
-          },
-          {
-            role: "user",
-            content: truncatedContent
+      // Implement rate limit handling with original functionality
+      return await this.throttleManager.enqueueRequest(async () => {
+        return await this.rateLimitHandler.retryWithBackoff(async () => {
+          try {
+            console.log(`[Azure] Sending request to model ${model}`);
+            
+            // Prepare request info for tracking
+            const requestInfo = {
+              url: '/chat/completions',
+              method: 'POST',
+              model: model
+            };
+            
+            let responseInfo = null;
+            let error = null;
+            
+            try {
+              const response = await this.client.chat.completions.create({
+                model: model,
+                messages: [
+                  {
+                    role: "system",
+                    content: systemPrompt
+                  },
+                  {
+                    role: "user",
+                    content: truncatedContent
+                  }
+                ],
+                temperature: 0.3,
+              });
+              
+              responseInfo = response;
+              
+              // Extract and track rate limit headers
+              if (response.headers) {
+                console.log('[DEBUG] Azure API response headers:', JSON.stringify(response.headers));
+                this.rateLimitTracker.updateFromHeaders(response.headers);
+              }
+              
+              // The Azure OpenAI SDK may not provide rate limit headers
+              // Use the usage information as a proxy for rate limits
+              if (response.usage) {
+                const usage = response.usage;
+                console.log('[DEBUG] Azure API usage:', JSON.stringify(usage));
+                
+                // Create a synthetic status and tracking data
+                responseInfo.status = 200; // We know it succeeded if we got here
+                
+                // Manually store the usage information in our rate limit tracker
+                this.rateLimitTracker.limits = {
+                  ...this.rateLimitTracker.limits,
+                  lastUpdated: new Date(),
+                  // We don't have actual request limits from Azure, 
+                  // but we can track token usage
+                  lastTokenUsage: usage.total_tokens || 0,
+                  totalTokensUsed: (this.rateLimitTracker.limits.totalTokensUsed || 0) + usage.total_tokens
+                };
+                
+                // Set some rate limit info for the ApiCallTracker
+                responseInfo.headers = {
+                  'x-ratelimit-remaining-tokens': "100000", // Placeholder
+                  'x-usage-tokens-total': usage.total_tokens?.toString(),
+                  'x-usage-tokens-prompt': usage.prompt_tokens?.toString(),
+                  'x-usage-tokens-completion': usage.completion_tokens?.toString()
+                };
+                
+                console.log('[DEBUG] Updated rate tracker with usage information');
+              }
+              
+              if (!response?.choices?.[0]?.message?.content) {
+                throw new Error('Invalid API response structure');
+              }
+              
+              console.log(`[DEBUG] [${timestamp}] Azure request sent`);
+              console.log(`[DEBUG] [${timestamp}] Total tokens: ${response.usage.total_tokens}`);
+              
+              const usage = response.usage;
+              const mappedUsage = {
+                promptTokens: usage.prompt_tokens,
+                completionTokens: usage.completion_tokens,
+                totalTokens: usage.total_tokens
+              };
+
+              let jsonContent = response.choices[0].message.content;
+              jsonContent = jsonContent.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+              let parsedResponse;
+              try {
+                parsedResponse = JSON.parse(jsonContent);
+                //write to file and append to the file (txt)
+                fs.appendFile('./logs/response.txt', jsonContent, (err) => {
+                  if (err) throw err;
+                });
+              } catch (error) {
+                console.error('Failed to parse JSON response:', error);
+                throw new Error('Invalid JSON response from API');
+              }
+
+              if (!parsedResponse || !Array.isArray(parsedResponse.tags) || typeof parsedResponse.correspondent !== 'string') {
+                throw new Error('Invalid response structure: missing tags array or correspondent string');
+              }
+
+              return { 
+                document: parsedResponse, 
+                metrics: mappedUsage,
+                truncated: truncatedContent.length < content.length
+              };
+            } catch (e) {
+              error = e;
+              throw e;
+            } finally {
+              // Store raw response data for debugging
+              if (responseInfo && !responseInfo.rawHeaders && responseInfo.headers) {
+                // Store the headers we have set previously for debugging
+                responseInfo.rawHeaders = { ...responseInfo.headers };
+              }
+              
+              // Track the API call with all available header information
+              this.apiCallTracker.trackApiCall(requestInfo, responseInfo, error);
+            }
+          } catch (error) {
+            // Enhanced error logging for rate limits
+            if (error?.response?.status === 429 || error?.status === 429) {
+              console.error('[Rate Limit] Azure API error:', {
+                message: error.message,
+                headers: error.response?.headers,
+                currentLimits: this.rateLimitTracker.limits
+              });
+            } else {
+              console.error('[ERROR] Azure API request failed:', error.message);
+            }
+            throw error; // Rethrow to be handled by the rate limit handler
           }
-        ],
-        temperature: 0.3,
-      });
-      
-      if (!response?.choices?.[0]?.message?.content) {
-        throw new Error('Invalid API response structure');
-      }
-      
-      console.log(`[DEBUG] [${timestamp}] Azure request sent`);
-      console.log(`[DEBUG] [${timestamp}] Total tokens: ${response.usage.total_tokens}`);
-      
-      const usage = response.usage;
-      const mappedUsage = {
-        promptTokens: usage.prompt_tokens,
-        completionTokens: usage.completion_tokens,
-        totalTokens: usage.total_tokens
-      };
-
-      let jsonContent = response.choices[0].message.content;
-      jsonContent = jsonContent.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-
-      let parsedResponse;
-      try {
-        parsedResponse = JSON.parse(jsonContent);
-        //write to file and append to the file (txt)
-        fs.appendFile('./logs/response.txt', jsonContent, (err) => {
-          if (err) throw err;
         });
-      } catch (error) {
-        console.error('Failed to parse JSON response:', error);
-        throw new Error('Invalid JSON response from API');
-      }
-
-      if (!parsedResponse || !Array.isArray(parsedResponse.tags) || typeof parsedResponse.correspondent !== 'string') {
-        throw new Error('Invalid response structure: missing tags array or correspondent string');
-      }
-
-      return { 
-        document: parsedResponse, 
-        metrics: mappedUsage,
-        truncated: truncatedContent.length < content.length
-      };
+      });
     } catch (error) {
       console.error('Failed to analyze document:', error);
       return { 
@@ -241,7 +327,7 @@ class AzureOpenAIService {
         error: error.message 
       };
     }
-}
+  }
 
   async writePromptToFile(systemPrompt, truncatedContent) {
     const filePath = './logs/prompt.txt';
@@ -266,97 +352,128 @@ class AzureOpenAIService {
   }
 
   async analyzePlayground(content, prompt) {
-    const musthavePrompt = `
-    Return the result EXCLUSIVELY as a JSON object. The Tags and Title MUST be in the language that is used in the document.:  
-        {
-          "title": "xxxxx",
-          "correspondent": "xxxxxxxx",
-          "tags": ["Tag1", "Tag2", "Tag3", "Tag4"],
-          "document_date": "YYYY-MM-DD",
-          "language": "en/de/es/..."
-        }`;
-
     try {
       this.initialize();
-      const now = new Date();
-      const timestamp = now.toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' });
       
       if (!this.client) {
-        throw new Error('OpenAI client not initialized - missing API key');
+        throw new Error('AzureOpenAI client not initialized');
       }
+
+      const model = process.env.AZURE_DEPLOYMENT_NAME;
+      console.log(`Using Azure model: ${model}`);
+
+      // Calculate tokens for content
+      const contentTokens = await this.calculateTokens(content);
+      const promptTokens = await this.calculateTokens(prompt);
+      const totalTokens = contentTokens + promptTokens;
       
-      // Calculate total prompt tokens including musthavePrompt
-      const totalPromptTokens = await this.calculateTotalPromptTokens(
-        prompt + musthavePrompt // Combined system prompt
-      );
+      console.log(`Content tokens: ${contentTokens}, Prompt tokens: ${promptTokens}, Total: ${totalTokens}`);
       
-      // Calculate available tokens
-      const maxTokens = 128000;
-      const reservedTokens = totalPromptTokens + 1000; // Reserve for response
-      const availableTokens = maxTokens - reservedTokens;
+      // Check if we need to truncate
+      let truncatedContent = content;
+      const maxTokens = 128000 - 1000; // Reserve 1000 tokens for the response
       
-      // Truncate content if necessary
-      const truncatedContent = await this.truncateToTokenLimit(content, availableTokens);
-      
-      // Make API request
-      const response = await this.client.chat.completions.create({
-        model: process.env.OPENAI_MODEL,
-        messages: [
-          {
-            role: "system",
-            content: prompt + musthavePrompt
-          },
-          {
-            role: "user",
-            content: truncatedContent
+      if (totalTokens > maxTokens) {
+        console.log(`Total tokens (${totalTokens}) exceeds max limit (${maxTokens}), truncating...`);
+        const availableContentTokens = maxTokens - promptTokens;
+        truncatedContent = await this.truncateToTokenLimit(content, availableContentTokens);
+        console.log(`Truncated content to ${await this.calculateTokens(truncatedContent)} tokens`);
+      }
+
+      // Use throttle manager and rate limit handler for playground requests too
+      return await this.throttleManager.enqueueRequest(async () => {
+        return await this.rateLimitHandler.retryWithBackoff(async () => {
+          try {
+            console.log('Sending request to Azure OpenAI API...');
+            
+            const response = await this.client.chat.completions.create({
+              model: model,
+              messages: [
+                {
+                  role: "system",
+                  content: prompt
+                },
+                {
+                  role: "user",
+                  content: truncatedContent
+                }
+              ],
+              temperature: 0.3,
+            });
+            
+            // Extract and track rate limit headers
+            if (response.headers) {
+              console.log('[DEBUG] Azure API response headers:', JSON.stringify(response.headers));
+              this.rateLimitTracker.updateFromHeaders(response.headers);
+            }
+            
+            // The Azure OpenAI SDK may not provide rate limit headers
+            // Use the usage information as a proxy for rate limits
+            if (response.usage) {
+              const usage = response.usage;
+              console.log('[DEBUG] Azure API usage:', JSON.stringify(usage));
+              
+              // Create a synthetic status and tracking data
+              const responseInfo = {
+                status: 200,
+                headers: {
+                  'x-ratelimit-remaining-tokens': "100000", // Placeholder
+                  'x-usage-tokens-total': usage.total_tokens?.toString(),
+                  'x-usage-tokens-prompt': usage.prompt_tokens?.toString(),
+                  'x-usage-tokens-completion': usage.completion_tokens?.toString()
+                }
+              };
+              
+              // Manually store the usage information in our rate limit tracker
+              this.rateLimitTracker.limits = {
+                ...this.rateLimitTracker.limits,
+                lastUpdated: new Date(),
+                lastTokenUsage: usage.total_tokens || 0
+              };
+              
+              // Track the API call
+              this.apiCallTracker.trackApiCall(
+                { url: '/chat/completions', method: 'POST', model: model },
+                responseInfo
+              );
+            }
+            
+            if (!response?.choices?.[0]?.message?.content) {
+              throw new Error('Invalid API response structure');
+            }
+            
+            console.log(`Response received, ${response.usage.total_tokens} tokens used`);
+            
+            return {
+              content: response.choices[0].message.content,
+              usage: {
+                promptTokens: response.usage.prompt_tokens,
+                completionTokens: response.usage.completion_tokens,
+                totalTokens: response.usage.total_tokens
+              },
+              truncated: truncatedContent.length < content.length
+            };
+          } catch (error) {
+            // Enhanced error logging for rate limits
+            if (error?.response?.status === 429 || error?.status === 429) {
+              console.error('[Rate Limit] Azure API playground error:', {
+                message: error.message,
+                headers: error.response?.headers,
+                currentLimits: this.rateLimitTracker.limits
+              });
+            } else {
+              console.error('Azure API playground request failed:', error.message);
+            }
+            throw error; // Rethrow to be handled by the rate limit handler
           }
-        ],
-        temperature: 0.3,
+        });
       });
-      
-      // Handle response
-      if (!response?.choices?.[0]?.message?.content) {
-        throw new Error('Invalid API response structure');
-      }
-      
-      // Log token usage
-      console.log(`[DEBUG] [${timestamp}] OpenAI request sent`);
-      console.log(`[DEBUG] [${timestamp}] Total tokens: ${response.usage.total_tokens}`);
-      
-      const usage = response.usage;
-      const mappedUsage = {
-        promptTokens: usage.prompt_tokens,
-        completionTokens: usage.completion_tokens,
-        totalTokens: usage.total_tokens
-      };
-
-      let jsonContent = response.choices[0].message.content;
-      jsonContent = jsonContent.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-
-      let parsedResponse;
-      try {
-        parsedResponse = JSON.parse(jsonContent);
-      } catch (error) {
-        console.error('Failed to parse JSON response:', error);
-        throw new Error('Invalid JSON response from API');
-      }
-
-      // Validate response structure
-      if (!parsedResponse || !Array.isArray(parsedResponse.tags) || typeof parsedResponse.correspondent !== 'string') {
-        throw new Error('Invalid response structure: missing tags array or correspondent string');
-      }
-
-      return { 
-        document: parsedResponse, 
-        metrics: mappedUsage,
-        truncated: truncatedContent.length < content.length
-      };
     } catch (error) {
-      console.error('Failed to analyze document:', error);
+      console.error('Failed to analyze in playground:', error);
       return { 
-        document: { tags: [], correspondent: null },
-        metrics: null,
-        error: error.message 
+        content: null,
+        usage: null,
+        error: error.message
       };
     }
   }

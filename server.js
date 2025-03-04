@@ -330,6 +330,259 @@ async function scanDocuments() {
 // Routes
 app.use('/', setupRoutes);
 
+/**
+ * @swagger
+ * /api/provider-status:
+ *   get:
+ *     summary: Get status of AI providers including rate limit information
+ *     description: |
+ *       Provides comprehensive information about the current AI provider's status,
+ *       including rate limit data, throttling configuration, and recent API call history.
+ *       
+ *       This endpoint allows monitoring of rate limits in real-time, tracking API call
+ *       success rates, and diagnosing issues with AI providers. Use it to verify the
+ *       effectiveness of rate limiting mechanisms and detect potential API problems.
+ *     tags: 
+ *       - API
+ *       - System
+ *     security:
+ *       - ApiKeyAuth: []
+ *     responses:
+ *       200:
+ *         description: Detailed status information about the AI provider
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status:
+ *                   type: string
+ *                   description: Overall status of the AI provider
+ *                   example: "ok"
+ *                 provider:
+ *                   type: string
+ *                   description: Name of the current AI provider
+ *                   example: "azure"
+ *                 rateLimits:
+ *                   type: object
+ *                   description: Information about current rate limit status
+ *                   properties:
+ *                     remainingRequests:
+ *                       type: integer
+ *                       description: Number of requests remaining in the current time window
+ *                       example: 950
+ *                     remainingTokens:
+ *                       type: integer
+ *                       description: Number of tokens remaining in the current time window
+ *                       example: 90000
+ *                     resetAt:
+ *                       type: string
+ *                       format: date-time
+ *                       description: Time when the rate limits will reset
+ *                       example: "2025-03-04T19:30:00.000Z"
+ *                     lastUpdated:
+ *                       type: string
+ *                       format: date-time
+ *                       description: Time when rate limit information was last updated
+ *                       example: "2025-03-04T19:15:22.456Z"
+ *                 throttling:
+ *                   type: object
+ *                   description: Information about request throttling status
+ *                   properties:
+ *                     queuedRequests:
+ *                       type: integer
+ *                       description: Number of requests currently in the queue
+ *                       example: 2
+ *                     isProcessing:
+ *                       type: boolean
+ *                       description: Whether requests are currently being processed
+ *                       example: true
+ *                     minRequestGap:
+ *                       type: integer
+ *                       description: Minimum time (ms) between API requests
+ *                       example: 100
+ *                 rateLimitHandler:
+ *                   type: object
+ *                   description: Configuration of the rate limit handler
+ *                   properties:
+ *                     baseDelay:
+ *                       type: integer
+ *                       description: Base delay (ms) for exponential backoff
+ *                       example: 1000
+ *                     maxDelay:
+ *                       type: integer
+ *                       description: Maximum delay (ms) for exponential backoff
+ *                       example: 60000
+ *                     maxAttempts:
+ *                       type: integer
+ *                       description: Maximum number of retry attempts
+ *                       example: 6
+ *                 recentCalls:
+ *                   type: array
+ *                   description: List of recent API calls and their outcomes
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       timestamp:
+ *                         type: string
+ *                         format: date-time
+ *                         description: When the API call was made
+ *                         example: "2025-03-04T19:14:26.123Z"
+ *                       endpoint:
+ *                         type: string
+ *                         description: The API endpoint that was called
+ *                         example: "/chat/completions"
+ *                       method:
+ *                         type: string
+ *                         description: HTTP method used
+ *                         example: "POST"
+ *                       status:
+ *                         type: integer
+ *                         description: HTTP status code of the response
+ *                         example: 200
+ *                       latency:
+ *                         type: integer
+ *                         description: Response time in milliseconds
+ *                         example: 850
+ *                       errorMessage:
+ *                         type: string
+ *                         description: Error message if the call failed
+ *                         example: null
+ *                       fullHeaders:
+ *                         type: object
+ *                         description: Complete headers from the API response
+ *                 callStats:
+ *                   type: object
+ *                   description: Aggregated statistics about recent API calls
+ *                   properties:
+ *                     totalCalls:
+ *                       type: integer
+ *                       description: Total number of tracked API calls
+ *                       example: 50
+ *                     successCalls:
+ *                       type: integer
+ *                       description: Number of successful API calls (2xx status)
+ *                       example: 48
+ *                     errorCalls:
+ *                       type: integer
+ *                       description: Number of failed API calls (4xx/5xx status)
+ *                       example: 2
+ *                     rateLimitedCalls:
+ *                       type: integer
+ *                       description: Number of rate-limited API calls (429 status)
+ *                       example: 1
+ *                     avgLatency:
+ *                       type: number
+ *                       description: Average response time in milliseconds
+ *                       example: 890.5
+ *       401:
+ *         description: Authentication required
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status:
+ *                   type: string
+ *                   example: "error"
+ *                 message:
+ *                   type: string
+ *                   example: "Authentication required"
+ *       500:
+ *         description: Server error while retrieving provider status
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status:
+ *                   type: string
+ *                   example: "error"
+ *                 message:
+ *                   type: string
+ *                   example: "Error retrieving provider status"
+ *                 error:
+ *                   type: string
+ *                   example: "Failed to connect to AI provider"
+ */
+app.get('/api/provider-status', async (req, res) => {
+  try {
+    console.log('[DEBUG] /api/provider-status endpoint called');
+    
+    const aiService = AIServiceFactory.getService();
+    console.log('[DEBUG] AI Service retrieved, provider:', config.aiProvider);
+    console.log('[DEBUG] Has rate trackers:', {
+      rateLimitTracker: !!aiService.rateLimitTracker,
+      throttleManager: !!aiService.throttleManager,
+      rateLimitHandler: !!aiService.rateLimitHandler,
+      apiCallTracker: !!aiService.apiCallTracker
+    });
+    
+    if (aiService.rateLimitTracker && aiService.rateLimitTracker.limits) {
+      console.log('[DEBUG] Current rate limits:', JSON.stringify(aiService.rateLimitTracker.limits));
+    }
+    
+    const result = {
+      status: 'ok',
+      provider: config.aiProvider,
+      rateLimits: {},
+      throttling: {},
+      rateLimitHandler: {},
+      recentCalls: [],
+      callStats: {}
+    };
+
+    // Get rate limit information if available
+    if (aiService.rateLimitTracker) {
+      // Display more information from the rate limit tracker
+      result.rateLimits = {
+        remainingRequests: aiService.rateLimitTracker.limits.remainingRequests || 1000,
+        remainingTokens: aiService.rateLimitTracker.limits.remainingTokens || 100000,
+        totalTokensUsed: aiService.rateLimitTracker.limits.totalTokensUsed || 0,
+        resetAt: aiService.rateLimitTracker.limits.resetAt || new Date(Date.now() + 3600000),
+        lastUpdated: aiService.rateLimitTracker.limits.lastUpdated || new Date()
+      };
+    }
+
+    // Get throttling information if available
+    if (aiService.throttleManager) {
+      result.throttling = {
+        queuedRequests: aiService.throttleManager.requestQueue.length,
+        isProcessing: aiService.throttleManager.isProcessing,
+        minRequestGap: aiService.throttleManager.minRequestGap
+      };
+    }
+
+    // Get rate limit handler information if available
+    if (aiService.rateLimitHandler) {
+      result.rateLimitHandler = {
+        baseDelay: aiService.rateLimitHandler.baseDelay,
+        maxDelay: aiService.rateLimitHandler.maxDelay,
+        maxAttempts: aiService.rateLimitHandler.maxAttempts
+      };
+    }
+
+    // Get API call tracker information if available
+    if (aiService.apiCallTracker) {
+      // Get the recent calls and preserve fullHeaders
+      result.recentCalls = aiService.apiCallTracker.getRecentCalls().map(call => ({
+        ...call,
+        // Ensure fullHeaders is included in the response
+        fullHeaders: call.fullHeaders || {}
+      }));
+      result.callStats = aiService.apiCallTracker.getCallStats();
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error('[ERROR] provider-status endpoint:', error);
+    res.status(500).json({
+      status: 'error',
+      message: error.message 
+    });
+  }
+});
+
 app.get('/', async (req, res) => {
   try {
     res.redirect('/dashboard');
@@ -376,7 +629,7 @@ async function startScanning() {
 
     const userId = await paperlessService.getOwnUserID();
     if (!userId) {
-      console.error('Failed to get own user ID. Abort scanning.');
+      console.error('Server.js(line 609): Failed to get own user ID. Abort scanning.');
       return;
     }
 

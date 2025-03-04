@@ -416,8 +416,14 @@ try {
 
     const userId = await paperlessService.getOwnUserID();
     if (!userId) {
-      console.error('Failed to get own user ID. Abort scanning.');
+      console.error('setup.js (line 419): Failed to get own user ID. Abort scanning.');
       return;
+    }
+    
+    // Get the force parameter from the request body
+    const forceReprocess = req.body.force === true;
+    if (forceReprocess) {
+      console.log('[INFO] Force reprocessing enabled - will process all documents regardless of processed status');
     }
     
       try {
@@ -433,7 +439,44 @@ try {
     
         for (const doc of documents) {
           try {
-            const result = await processDocument(doc, existingTags, existingCorrespondentList, ownUserId);
+            // If forceReprocess is true, we'll bypass the normal isDocumentProcessed check
+            let result;
+            if (forceReprocess) {
+              // Temporarily mark the document as not processed
+              await documentModel.setProcessingStatus(doc.id, doc.title, 'processing');
+              
+              // Get document content and original data
+              let [content, originalData] = await Promise.all([
+                paperlessService.getDocumentContent(doc.id),
+                paperlessService.getDocument(doc.id)
+              ]);
+              
+              // Skip documents with no content
+              if (!content || !content.length >= 10) {
+                console.log(`[DEBUG] Document ${doc.id} has no content, skipping analysis`);
+                continue;
+              }
+              
+              if (content.length > 50000) {
+                content = content.substring(0, 50000);
+              }
+              
+              // Process with AI service
+              const aiService = AIServiceFactory.getService();
+              const analysis = await aiService.analyzeDocument(content, existingTags, existingCorrespondentList, doc.id);
+              console.log('Response from AI service:', analysis);
+              
+              if (analysis.error) {
+                throw new Error(`[ERROR] Document analysis failed: ${analysis.error}`);
+              }
+              
+              await documentModel.setProcessingStatus(doc.id, doc.title, 'complete');
+              result = { analysis, originalData };
+            } else {
+              // Normal processing path - will skip already processed documents
+              result = await processDocument(doc, existingTags, existingCorrespondentList, ownUserId);
+            }
+            
             if (!result) continue;
     
             const { analysis, originalData } = result;
@@ -843,7 +886,7 @@ async function processQueue(customPrompt) {
 
     const userId = await paperlessService.getOwnUserID();
     if (!userId) {
-      console.error('Failed to get own user ID. Abort scanning.');
+      console.error('setup.js (line 846): Failed to get own user ID. Abort scanning.');
       return;
     }
 

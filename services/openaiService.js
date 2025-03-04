@@ -4,11 +4,16 @@ const tiktoken = require('tiktoken');
 const paperlessService = require('./paperlessService');
 const fs = require('fs').promises;
 const path = require('path');
+const { RateLimitHandler, RateLimitTracker, ThrottleManager, ApiCallTracker } = require('./rateLimitUtils');
 
 class OpenAIService {
   constructor() {
     this.client = null;
     this.tokenizer = null;
+    this.rateLimitHandler = new RateLimitHandler();
+    this.rateLimitTracker = new RateLimitTracker();
+    this.throttleManager = new ThrottleManager();
+    this.apiCallTracker = new ApiCallTracker();
   }
 
   initialize() {
@@ -171,59 +176,126 @@ class OpenAIService {
       
       await this.writePromptToFile(systemPrompt, truncatedContent);
 
-      const response = await this.client.chat.completions.create({
-        model: model,
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt
-          },
-          {
-            role: "user",
-            content: truncatedContent
+      // Implement rate limit handling with original functionality
+      return await this.throttleManager.enqueueRequest(async () => {
+        return await this.rateLimitHandler.retryWithBackoff(async () => {
+          try {
+            console.log(`[OpenAI] Sending request to model ${model}`);
+            
+            // Prepare request info for tracking
+            const requestInfo = {
+              url: '/chat/completions',
+              method: 'POST',
+              model: model
+            };
+            
+            let responseInfo = null;
+            let error = null;
+            
+            try {
+              const response = await this.client.chat.completions.create({
+                model: model,
+                messages: [
+                  {
+                    role: "system",
+                    content: systemPrompt
+                  },
+                  {
+                    role: "user",
+                    content: truncatedContent
+                  }
+                ],
+                temperature: 0.3,
+              });
+              
+              responseInfo = response;
+              
+              // Extract and track rate limit headers
+              if (response.headers) {
+                console.log('[DEBUG] OpenAI API response headers:', JSON.stringify(response.headers));
+                this.rateLimitTracker.updateFromHeaders(response.headers);
+                
+                // Store rate limit information in responseInfo for the ApiCallTracker
+                responseInfo.headers = {
+                  ...response.headers,
+                  // Add standardized rate limit headers if they don't exist 
+                  // but other OpenAI-specific headers are present
+                  'x-ratelimit-remaining-requests': 
+                    response.headers['x-ratelimit-remaining-requests'] || 
+                    response.headers['x-ratelimit-remaining'] ||
+                    null,
+                  'x-ratelimit-remaining-tokens': 
+                    response.headers['x-ratelimit-remaining-tokens'] || 
+                    null,
+                  'x-response-time': response.headers['x-response-time'] || 
+                    response.latency || 
+                    null
+                };
+                
+                // Store the original headers as-is for debugging
+                responseInfo.rawHeaders = { ...response.headers };
+              }
+              
+              if (!response?.choices?.[0]?.message?.content) {
+                throw new Error('Invalid API response structure');
+              }
+              
+              console.log(`[DEBUG] [${timestamp}] OpenAI request sent`);
+              console.log(`[DEBUG] [${timestamp}] Total tokens: ${response.usage.total_tokens}`);
+              
+              const usage = response.usage;
+              const mappedUsage = {
+                promptTokens: usage.prompt_tokens,
+                completionTokens: usage.completion_tokens,
+                totalTokens: usage.total_tokens
+              };
+
+              let jsonContent = response.choices[0].message.content;
+              jsonContent = jsonContent.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+
+              let parsedResponse;
+              try {
+                parsedResponse = JSON.parse(jsonContent);
+                //write to file and append to the file (txt)
+                fs.appendFile('./logs/response.txt', jsonContent, (err) => {
+                  if (err) throw err;
+                });
+              } catch (error) {
+                console.error('Failed to parse JSON response:', error);
+                throw new Error('Invalid JSON response from API');
+              }
+
+              if (!parsedResponse || !Array.isArray(parsedResponse.tags) || typeof parsedResponse.correspondent !== 'string') {
+                throw new Error('Invalid response structure: missing tags array or correspondent string');
+              }
+
+              return { 
+                document: parsedResponse, 
+                metrics: mappedUsage,
+                truncated: truncatedContent.length < content.length
+              };
+            } catch (e) {
+              error = e;
+              throw e;
+            } finally {
+              // Track the API call
+              this.apiCallTracker.trackApiCall(requestInfo, responseInfo, error);
+            }
+          } catch (error) {
+            // Enhanced error logging for rate limits
+            if (error?.response?.status === 429 || error?.status === 429) {
+              console.error('[Rate Limit] OpenAI API error:', {
+                message: error.message,
+                headers: error.response?.headers,
+                currentLimits: this.rateLimitTracker.limits
+              });
+            } else {
+              console.error('[ERROR] OpenAI API request failed:', error.message);
+            }
+            throw error; // Rethrow to be handled by the rate limit handler
           }
-        ],
-        temperature: 0.3,
-      });
-      
-      if (!response?.choices?.[0]?.message?.content) {
-        throw new Error('Invalid API response structure');
-      }
-      
-      console.log(`[DEBUG] [${timestamp}] OpenAI request sent`);
-      console.log(`[DEBUG] [${timestamp}] Total tokens: ${response.usage.total_tokens}`);
-      
-      const usage = response.usage;
-      const mappedUsage = {
-        promptTokens: usage.prompt_tokens,
-        completionTokens: usage.completion_tokens,
-        totalTokens: usage.total_tokens
-      };
-
-      let jsonContent = response.choices[0].message.content;
-      jsonContent = jsonContent.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-
-      let parsedResponse;
-      try {
-        parsedResponse = JSON.parse(jsonContent);
-        //write to file and append to the file (txt)
-        fs.appendFile('./logs/response.txt', jsonContent, (err) => {
-          if (err) throw err;
         });
-      } catch (error) {
-        console.error('Failed to parse JSON response:', error);
-        throw new Error('Invalid JSON response from API');
-      }
-
-      if (!parsedResponse || !Array.isArray(parsedResponse.tags) || typeof parsedResponse.correspondent !== 'string') {
-        throw new Error('Invalid response structure: missing tags array or correspondent string');
-      }
-
-      return { 
-        document: parsedResponse, 
-        metrics: mappedUsage,
-        truncated: truncatedContent.length < content.length
-      };
+      });
     } catch (error) {
       console.error('Failed to analyze document:', error);
       return { 
@@ -232,7 +304,7 @@ class OpenAIService {
         error: error.message 
       };
     }
-}
+  }
 
   async writePromptToFile(systemPrompt, truncatedContent) {
     const filePath = './logs/prompt.txt';
@@ -257,97 +329,96 @@ class OpenAIService {
   }
 
   async analyzePlayground(content, prompt) {
-    const musthavePrompt = `
-    Return the result EXCLUSIVELY as a JSON object. The Tags and Title MUST be in the language that is used in the document.:  
-        {
-          "title": "xxxxx",
-          "correspondent": "xxxxxxxx",
-          "tags": ["Tag1", "Tag2", "Tag3", "Tag4"],
-          "document_date": "YYYY-MM-DD",
-          "language": "en/de/es/..."
-        }`;
-
     try {
       this.initialize();
-      const now = new Date();
-      const timestamp = now.toLocaleString('de-DE', { dateStyle: 'short', timeStyle: 'short' });
       
       if (!this.client) {
-        throw new Error('OpenAI client not initialized - missing API key');
+        throw new Error('OpenAI client not initialized');
       }
+
+      const model = process.env.OPENAI_MODEL;
+      console.log(`Using model: ${model}`);
+
+      // Calculate tokens for content
+      const contentTokens = await this.calculateTokens(content);
+      const promptTokens = await this.calculateTokens(prompt);
+      const totalTokens = contentTokens + promptTokens;
       
-      // Calculate total prompt tokens including musthavePrompt
-      const totalPromptTokens = await this.calculateTotalPromptTokens(
-        prompt + musthavePrompt // Combined system prompt
-      );
+      console.log(`Content tokens: ${contentTokens}, Prompt tokens: ${promptTokens}, Total: ${totalTokens}`);
       
-      // Calculate available tokens
-      const maxTokens = 128000;
-      const reservedTokens = totalPromptTokens + 1000; // Reserve for response
-      const availableTokens = maxTokens - reservedTokens;
+      // Check if we need to truncate
+      let truncatedContent = content;
+      const maxTokens = 128000 - 1000; // Reserve 1000 tokens for the response
       
-      // Truncate content if necessary
-      const truncatedContent = await this.truncateToTokenLimit(content, availableTokens);
-      
-      // Make API request
-      const response = await this.client.chat.completions.create({
-        model: process.env.OPENAI_MODEL,
-        messages: [
-          {
-            role: "system",
-            content: prompt + musthavePrompt
-          },
-          {
-            role: "user",
-            content: truncatedContent
+      if (totalTokens > maxTokens) {
+        console.log(`Total tokens (${totalTokens}) exceeds max limit (${maxTokens}), truncating...`);
+        const availableContentTokens = maxTokens - promptTokens;
+        truncatedContent = await this.truncateToTokenLimit(content, availableContentTokens);
+        console.log(`Truncated content to ${await this.calculateTokens(truncatedContent)} tokens`);
+      }
+
+      // Use throttle manager and rate limit handler for playground requests too
+      return await this.throttleManager.enqueueRequest(async () => {
+        return await this.rateLimitHandler.retryWithBackoff(async () => {
+          try {
+            console.log('Sending request to OpenAI API...');
+            
+            const response = await this.client.chat.completions.create({
+              model: model,
+              messages: [
+                {
+                  role: "system",
+                  content: prompt
+                },
+                {
+                  role: "user",
+                  content: truncatedContent
+                }
+              ],
+              temperature: 0.3,
+            });
+            
+            // Extract and track rate limit headers
+            if (response.headers) {
+              this.rateLimitTracker.updateFromHeaders(response.headers);
+            }
+            
+            if (!response?.choices?.[0]?.message?.content) {
+              throw new Error('Invalid API response structure');
+            }
+            
+            console.log(`Response received, ${response.usage.total_tokens} tokens used`);
+            
+            return {
+              content: response.choices[0].message.content,
+              usage: {
+                promptTokens: response.usage.prompt_tokens,
+                completionTokens: response.usage.completion_tokens,
+                totalTokens: response.usage.total_tokens
+              },
+              truncated: truncatedContent.length < content.length
+            };
+          } catch (error) {
+            // Enhanced error logging for rate limits
+            if (error?.response?.status === 429 || error?.status === 429) {
+              console.error('[Rate Limit] OpenAI API playground error:', {
+                message: error.message,
+                headers: error.response?.headers,
+                currentLimits: this.rateLimitTracker.limits
+              });
+            } else {
+              console.error('OpenAI API playground request failed:', error.message);
+            }
+            throw error; // Rethrow to be handled by the rate limit handler
           }
-        ],
-        temperature: 0.3,
+        });
       });
-      
-      // Handle response
-      if (!response?.choices?.[0]?.message?.content) {
-        throw new Error('Invalid API response structure');
-      }
-      
-      // Log token usage
-      console.log(`[DEBUG] [${timestamp}] OpenAI request sent`);
-      console.log(`[DEBUG] [${timestamp}] Total tokens: ${response.usage.total_tokens}`);
-      
-      const usage = response.usage;
-      const mappedUsage = {
-        promptTokens: usage.prompt_tokens,
-        completionTokens: usage.completion_tokens,
-        totalTokens: usage.total_tokens
-      };
-
-      let jsonContent = response.choices[0].message.content;
-      jsonContent = jsonContent.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-
-      let parsedResponse;
-      try {
-        parsedResponse = JSON.parse(jsonContent);
-      } catch (error) {
-        console.error('Failed to parse JSON response:', error);
-        throw new Error('Invalid JSON response from API');
-      }
-
-      // Validate response structure
-      if (!parsedResponse || !Array.isArray(parsedResponse.tags) || typeof parsedResponse.correspondent !== 'string') {
-        throw new Error('Invalid response structure: missing tags array or correspondent string');
-      }
-
-      return { 
-        document: parsedResponse, 
-        metrics: mappedUsage,
-        truncated: truncatedContent.length < content.length
-      };
     } catch (error) {
-      console.error('Failed to analyze document:', error);
+      console.error('Failed to analyze in playground:', error);
       return { 
-        document: { tags: [], correspondent: null },
-        metrics: null,
-        error: error.message 
+        content: null,
+        usage: null,
+        error: error.message
       };
     }
   }
